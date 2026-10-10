@@ -33,6 +33,7 @@ from sync_media import (
     check_binary,
     default_ffprobe,
     eprint,
+    find_tool,
     open_in_default_app,
     pick_hardware_encoder,
     run_checked,
@@ -427,14 +428,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--preview-at", type=float, metavar="SECONDS", help="プレビューする時刻（標準は中央）"
     )
-    parser.add_argument("--ffmpeg", default="ffmpeg", help="ffmpegのパス")
+    parser.add_argument("--ffmpeg", default=None, help="ffmpegのパス（標準は同梱のffmpeg、なければPATH）")
     parser.add_argument("--ffprobe", default=None, help="ffprobeのパス")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
-    ffmpeg = check_binary(args.ffmpeg, "ffmpeg")
+    ffmpeg = check_binary(args.ffmpeg or find_tool("ffmpeg"), "ffmpeg")
     ffprobe = check_binary(args.ffprobe or default_ffprobe(ffmpeg), "ffprobe")
 
     def load(paths: list[Path]) -> list[Source]:

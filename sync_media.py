@@ -250,10 +250,24 @@ def open_in_default_app(path: Path | str) -> None:
             subprocess.run([opener, str(path)], check=False)
 
 
+def find_tool(name: str) -> str:
+    """A bundled ffmpeg/ffprobe (``ffmpeg/mac``, ``ffmpeg/win``, ``ffmpeg/AMD``), else PATH."""
+    base = Path(__file__).resolve().parent / "ffmpeg"
+    if sys.platform == "darwin":
+        bundled = base / "mac" / name
+    elif sys.platform.startswith("win"):
+        bundled = base / "win" / f"{name}.exe"
+    else:
+        bundled = base / "AMD" / name
+    if bundled.exists():
+        return str(bundled)
+    return shutil.which(name) or name
+
+
 def default_ffprobe(ffmpeg: str) -> str:
     executable = Path(ffmpeg)
     sibling = executable.with_name("ffprobe" + executable.suffix)  # keeps ".exe" on Windows
-    return str(sibling) if sibling.exists() else "ffprobe"
+    return str(sibling) if sibling.exists() else find_tool("ffprobe")
 
 
 # ---------------------------------------------------------------------------
@@ -1190,7 +1204,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         metavar="FILE=SECONDS",
         help="人が確認した同期音の秒数（ファイル名・パス・入力番号で指定、複数可）",
     )
-    parser.add_argument("--ffmpeg", default="ffmpeg", help="ffmpegのパス")
+    parser.add_argument("--ffmpeg", default=None, help="ffmpegのパス（標準は同梱のffmpeg、なければPATH）")
     parser.add_argument("--ffprobe", default=None, help="ffprobeのパス")
     return parser
 
@@ -1200,7 +1214,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.pre_roll < 0:
         raise SyncError("--pre-roll は0以上にしてください。")
 
-    ffmpeg = check_binary(args.ffmpeg, "ffmpeg")
+    ffmpeg = check_binary(args.ffmpeg or find_tool("ffmpeg"), "ffmpeg")
     ffprobe = check_binary(args.ffprobe or default_ffprobe(ffmpeg), "ffprobe")
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)

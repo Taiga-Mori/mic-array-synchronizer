@@ -1,0 +1,8 @@
+[global]
+developmentMode = false
+
+[server]
+address = "localhost"
+
+[browser]
+gatherUsageStats = false
