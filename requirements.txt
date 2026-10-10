@@ -1,0 +1,10 @@
+# sync_media.py / compose_media.py / media_gui.py
+numpy>=1.24
+
+# Also required, but not installed by pip:
+# - ffmpeg and ffprobe (on PATH, or pass --ffmpeg / --ffprobe)
+# - tkinter for media_gui.py: bundled with python.org / Homebrew Python on
+#   macOS and Windows; on Debian/Ubuntu install the python3-tk package.
+
+# Only for regenerating the README figures (docs/make_figures.py):
+# pillow>=10
