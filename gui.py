@@ -341,7 +341,7 @@ def sync_results(report: dict, job: jobs.Job) -> None:
             "タイムコード": item["timecode_status"],
         })  # fmt: skip
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-    drifts = [item["drift_ppm"] for item in report["inputs"]]
+    drifts = [item["drift_ppm"] for item in report["inputs"] if item["drift_ppm"] is not None] or [0.0]
     duration = report.get("common_duration_seconds") or 0
     spread = (max(drifts) - min(drifts)) * 1e-6 * duration * 1000
     st.caption(f"共通区間 {duration / 60:.1f} 分。ドリフトは補正しないため、終端では最大 約{spread:.0f} ms ずれます。"
