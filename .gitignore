@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Per-recording validation scripts and notes (contain local data paths)
+validation/
