@@ -3,7 +3,9 @@
 
 Every input is treated alike.  Each file is aligned in three steps:
 
-1. the beep is located roughly (harmonic energy, then an onset threshold);
+1. the beep is located roughly (how far its three harmonics stand out from
+   nearby frequencies, preferring candidates after a quiet moment, then an
+   onset threshold) on the channels that keep time with the majority;
 2. video timecode, when present, cross-checks the beep positions and guides
    files whose beep could not be found reliably; and
 3. the sound around the beep is cross-correlated (GCC-PHAT) between every pair
@@ -47,6 +49,20 @@ except ImportError as exc:  # pragma: no cover - exercised only on missing depen
 DETECTION_RATE = 16000
 CORRELATION_RATE = 16000
 HARMONIC_WEIGHTS = (1.0, 0.45, 0.20)
+# Frequencies (relative to each harmonic) whose median level is the local
+# background in tonal_scores(): outside a 50 ms block's main lobe, and inside
+# a speech harmonic spacing so that voices raise them as much as the harmonic.
+NEIGHBOUR_OFFSETS_HZ = (-240.0, -180.0, -120.0, 120.0, 180.0, 240.0)
+# The beep follows a quiet moment.  Candidates whose preceding 0.05-0.25 s is
+# this much quieter than the beep keep their full score; louder ones lose up
+# to PRE_SILENCE_PENALTY of it.  A preference, not a requirement.
+PRE_SILENCE_DB = -12.0
+PRE_SILENCE_PENALTY = 0.4
+# The beep is near the start of a recording (except later files of a split
+# one, which are placed by correlation).  In the first search of a file, a
+# candidate at the end of the searched span loses this much of its score,
+# linearly from none at its start.  Also a preference only.
+EARLY_PREFERENCE_PENALTY = 0.2
 CHECK_WAV_NAME = "sync_check.wav"
 PROGRESS_ENV = "MEDIA_SYNC_PROGRESS"
 REPORT_NAME = "report.json"
@@ -82,6 +98,7 @@ class AudioStream:
     channels: int
     codec: str
     offset: float  # stream start relative to the file start, in seconds
+    duration: float | None = None
 
 
 @dataclass
@@ -97,6 +114,8 @@ class Media:
     timecode_seconds: float | None
     label: str = ""
     output_path: Path | None = None
+    video_offset: float = 0.0
+    video_duration: float | None = None
 
     @property
     def main_audio(self) -> AudioStream:
@@ -139,6 +158,7 @@ class Alignment:
     channel: int = 0  # 0-based channel of the main audio stream used for analysis
     channel_scores: list[float] = field(default_factory=list)
     channel_onsets: dict[int, float] = field(default_factory=dict)  # 1-based channel
+    channel_lags_ms: dict[int, float] = field(default_factory=dict)  # 1-based, vs majority
     onset_seconds: float | None = None  # beep onset before correlation
     timecode_beep_seconds: float | None = None
     timecode_status: str = "unavailable"
@@ -380,6 +400,7 @@ def probe_media(path: Path, position: int, ffprobe: str) -> Media:
             channels=int(s.get("channels") or 0),
             codec=str(s.get("codec_name", "")),
             offset=max(0.0, _float_or(s.get("start_time"), format_start) - format_start),
+            duration=_float_or(s.get("duration"), 0.0) or None,
         )
         for s in streams
         if s.get("codec_type") == "audio"
@@ -407,6 +428,11 @@ def probe_media(path: Path, position: int, ffprobe: str) -> Media:
         video_size=(int(video[0]["width"]), int(video[0]["height"])) if video else None,
         timecode=timecode,
         timecode_seconds=parse_timecode(timecode, fps) if timecode else None,
+        video_offset=(
+            max(0.0, _float_or(video[0].get("start_time"), format_start) - format_start)
+            if video else 0.0
+        ),
+        video_duration=(_float_or(video[0].get("duration"), 0.0) or None) if video else None,
     )
 
 
@@ -491,9 +517,33 @@ def harmonic_amplitudes(
 
 def beep_frequencies(frequency_hz: float, sample_rate: int) -> tuple[float, float, float]:
     frequencies = (frequency_hz, frequency_hz * 2.0, frequency_hz * 3.0)
-    if frequencies[-1] >= sample_rate / 2:
+    if frequencies[-1] + max(NEIGHBOUR_OFFSETS_HZ) >= sample_rate / 2:
         raise SyncError(f"サンプルレート{sample_rate}Hzでは第3倍音を解析できません。")
     return frequencies
+
+
+def tonal_scores(blocks: np.ndarray, sample_rate: int, frequency_hz: float) -> np.ndarray:
+    """How clearly each block holds the beep's three harmonics.
+
+    Each harmonic's amplitude is divided by the median amplitude at nearby
+    frequencies, and the three ratios are combined by geometric mean.  Speech,
+    clatter and other broadband sounds are loud at the neighbours as well, and
+    a pure tone near the fundamental lacks the harmonics, so both score low
+    however loud they are.  The ratios are not weighted: speakers and rooms
+    change the harmonics' balance a lot (recorded beeps often have a stronger
+    second harmonic than fundamental).
+    """
+    frequencies = beep_frequencies(frequency_hz, sample_rate)
+    probes = [
+        f + offset for f in frequencies for offset in (0.0, *NEIGHBOUR_OFFSETS_HZ)
+    ]
+    amplitudes = harmonic_amplitudes(blocks, sample_rate, tuple(probes))
+    amplitudes = amplitudes.reshape(blocks.shape[0], len(frequencies), -1)
+    floor = 1e-7 * max(float(np.max(amplitudes)), 1e-30)
+    peaks = amplitudes[:, :, 0] + floor
+    neighbours = np.median(amplitudes[:, :, 1:], axis=2) + floor
+    ratios = np.clip(peaks / neighbours, 1.0, 1000.0)
+    return np.exp(np.mean(np.log(ratios), axis=1))
 
 
 def detect_beep(
@@ -502,6 +552,7 @@ def detect_beep(
     *,
     search_start_seconds: float,
     frequency_hz: float,
+    prefer_early: bool = False,
 ) -> tuple[float, dict[str, float]]:
     if samples.size < sample_rate:
         raise SyncError("解析対象が短すぎます（1秒未満）。")
@@ -513,18 +564,46 @@ def detect_beep(
     coarse_block = max(32, round(coarse_block_seconds * sample_rate))
     block_count = samples.size // coarse_block
     blocks = samples[: block_count * coarse_block].reshape(block_count, coarse_block)
-    score = harmonic_amplitudes(blocks, sample_rate, frequencies) @ weights
+    score = tonal_scores(blocks, sample_rate, frequency_hz)
+    loudness = np.sqrt(np.mean(np.square(blocks, dtype=np.float64), axis=1)) + 1e-12
 
+    # Averaging over 0.4 s favours the ~0.8 s beep over short tonal clicks.
     smooth_blocks = max(1, round(0.4 / coarse_block_seconds))
     smooth = np.convolve(score, np.ones(smooth_blocks) / smooth_blocks, mode="same")
-    peak_index = int(np.argmax(smooth))
-    peak_time_local = (peak_index + 0.5) * coarse_block_seconds
-    peak_value = float(smooth[peak_index])
 
+    def onset_block(index: int) -> int:
+        """First block of the tone around a smoothed peak."""
+        low = max(0, index - 3 * smooth_blocks // 2)
+        high = min(score.size, index + smooth_blocks // 2 + 1)
+        local = score[low:high]
+        return low + int(np.argmax(local >= 0.5 * float(local.max())))
+
+    def pre_silence_weight(index: int) -> float:
+        start = onset_block(index)
+        before = loudness[max(0, start - 5) : max(0, start - 1)]
+        if before.size == 0:
+            return 1.0
+        during = float(np.median(loudness[start : start + 6]))
+        level_db = 20.0 * math.log10(float(before.max()) / during)
+        excess = min(1.0, max(0.0, (level_db - PRE_SILENCE_DB) / -PRE_SILENCE_DB))
+        return 1.0 - PRE_SILENCE_PENALTY * excess
+
+    # Several candidates, then a preference for those that follow a quiet
+    # moment (and, in a whole-file search, for early ones).
     exclusion = max(1, round(1.5 / coarse_block_seconds))
-    comparison = smooth.copy()
-    comparison[max(0, peak_index - exclusion) : peak_index + exclusion + 1] = np.nan
-    second_value = float(np.nanmax(comparison)) if np.any(np.isfinite(comparison)) else 0.0
+    remaining = smooth.copy()
+    candidates: list[tuple[float, int]] = []
+    while len(candidates) < 8 and np.any(np.isfinite(remaining)):
+        index = int(np.nanargmax(remaining))
+        weight = pre_silence_weight(index)
+        if prefer_early:
+            weight *= 1.0 - EARLY_PREFERENCE_PENALTY * index / max(1, smooth.size - 1)
+        candidates.append((float(smooth[index]) * weight, index))
+        remaining[max(0, index - exclusion) : index + exclusion + 1] = np.nan
+    candidates.sort(reverse=True)
+    peak_value, peak_index = candidates[0]
+    second_value = candidates[1][0] if len(candidates) > 1 else 0.0
+    peak_time_local = (peak_index + 0.5) * coarse_block_seconds
     background = float(np.median(smooth))
     peak_to_second = peak_value / max(second_value, 1e-12)
     peak_to_background_db = 20.0 * math.log10(
@@ -557,17 +636,21 @@ def detect_beep(
     median = float(np.median(baseline))
     robust_sigma = 1.4826 * float(np.median(np.abs(baseline - median)))
     dynamic_range = max(0.0, float(np.max(fine_score)) - median)
-    threshold = median + max(12.0 * robust_sigma, 0.002 * dynamic_range)
+    # At least -40 dB from the peak: very quiet recordings (phones with noise
+    # suppression) otherwise trigger on faint noise well before the beep.
+    threshold = median + max(12.0 * robust_sigma, 0.01 * dynamic_range)
     threshold = min(threshold, median + 0.25 * dynamic_range)
 
-    run_length, required = 10, 8
+    # The beep lasts much longer than 50 ms; brief noises do not.
+    run_length, required = 50, 45
     onset_frame: int | None = None
     search_limit = peak_time_local + 0.10
     for index in range(0, fine_score.size - run_length + 1):
         if centers_local[index] > search_limit:
             break
         if np.count_nonzero(fine_score[index : index + run_length] > threshold) >= required:
-            onset_frame = index
+            # The run may start with a few frames still below the threshold.
+            onset_frame = index + int(np.argmax(fine_score[index : index + run_length] > threshold))
             break
     if onset_frame is None:
         raise SyncError("同期音候補は見つかりましたが、立ち上がりを確定できません。")
@@ -600,6 +683,7 @@ def locate_beep(
     start: float,
     length: float,
     frequency_hz: float,
+    prefer_early: bool = False,
 ) -> tuple[float, dict[str, float]]:
     """Find the beep in a mono mixdown of ``[start, start + length)``."""
     length = min(length, media.duration - start)
@@ -609,8 +693,58 @@ def locate_beep(
         media, ffmpeg, start=start, duration=length, rate=DETECTION_RATE, mix=True
     )
     return detect_beep(
-        samples[:, 0], rate, search_start_seconds=actual_start, frequency_hz=frequency_hz
+        samples[:, 0], rate, search_start_seconds=actual_start, frequency_hz=frequency_hz,
+        prefer_early=prefer_early,
     )
+
+
+def channel_majority(
+    samples: np.ndarray, rate: int, channels: list[int], tolerance: float = 0.001
+) -> tuple[list[int], dict[int, float]]:
+    """Channels that are in time with each other, measured by GCC-PHAT between them.
+
+    Some devices add a processed channel with extra latency (for example the
+    ReSpeaker array's channel 1 is ~60 ms late).  Each channel's lag against
+    every other is measured in four sub-windows; a lag counts only when the
+    sub-windows agree.  Returns the largest group of channels within
+    ``tolerance`` of each other (all of ``channels`` when no group is larger
+    than the rest, e.g. two disagreeing channels) and each channel's lag
+    against the group's first member.
+    """
+    if len(channels) < 2:
+        return channels, {}
+    pieces = 4
+    length = samples.shape[0] // pieces
+    nfft = 1 << (2 * length - 1).bit_length()
+    taper = tukey(length, 0.1)
+    spectra = {
+        c: [
+            np.fft.rfft(samples[k * length : (k + 1) * length, c].astype(np.float64) * taper, nfft)
+            for k in range(pieces)
+        ]
+        for c in channels
+    }
+    lag: dict[tuple[int, int], float] = {}
+    for i, first in enumerate(channels):
+        for second in channels[i + 1 :]:
+            values = [
+                gcc_phat(spectra[first][k], spectra[second][k], nfft, rate, 0.2)
+                for k in range(pieces)
+            ]
+            if max(values) - min(values) <= tolerance:
+                lag[first, second] = float(np.median(values))
+                lag[second, first] = -lag[first, second]
+
+    def together(a: int, b: int) -> bool:
+        return abs(lag.get((a, b), math.inf)) <= tolerance
+
+    groups = [[c for c in channels if c == seed or together(seed, c)] for seed in channels]
+    groups.sort(key=len, reverse=True)
+    best = groups[0]
+    if any(len(g) == len(best) and set(g) != set(best) for g in groups[1:]):
+        return channels, {}
+    lags = {c: lag[best[0], c] for c in channels if (best[0], c) in lag}
+    return best, {best[0]: 0.0, **lags}
 
 
 def refine_on_best_channel(
@@ -618,27 +752,27 @@ def refine_on_best_channel(
 ) -> None:
     """Choose the analysis channel and re-detect the beep onset there.
 
-    Some devices add a processed channel with extra latency (for example the
-    ReSpeaker array's channel 1 is ~70 ms late), so the onset is measured on
-    every channel that hears the beep and channels that disagree with the
-    majority are skipped.  Among the rest, the clearest one is used.
+    Only channels that hear the beep and keep time with the majority of the
+    file's channels are used (see channel_majority()); among them the onset
+    is measured on each, channels that disagree with the others' median are
+    skipped, and the clearest remaining one is used.
     """
     media = alignment.media
     assert alignment.coarse_seconds is not None
     start = max(0.0, alignment.coarse_seconds - 3.0)
     samples, rate, actual_start = decode_audio(media, ffmpeg, start=start, duration=6.0)
-    if 3 * frequency_hz >= rate / 2:
+    try:
+        beep_frequencies(frequency_hz, rate)
+    except SyncError:
         samples, rate, actual_start = decode_audio(
             media, ffmpeg, start=start, duration=6.0, rate=DETECTION_RATE
         )
-    frequencies = beep_frequencies(frequency_hz, rate)
-    weights = np.asarray(HARMONIC_WEIGHTS)
     block = round(0.05 * rate)
     count = samples.shape[0] // block
     scores: list[float] = []
     for channel in range(samples.shape[1]):
         blocks = samples[: count * block, channel].reshape(count, block)
-        score = harmonic_amplitudes(blocks, rate, frequencies) @ weights
+        score = tonal_scores(blocks, rate, frequency_hz)
         scores.append(float(np.max(score) / max(float(np.median(score)), 1e-12)))
     alignment.channel = int(np.argmax(scores))
     alignment.channel_scores = [round(s, 2) for s in scores]
@@ -646,10 +780,22 @@ def refine_on_best_channel(
     if alignment.source == "timecode":
         return
 
+    hearing = [c for c, s in enumerate(scores) if s >= 0.25 * max(scores)]
+    if len(hearing) > 1:
+        # Conversation after the beep: broadband, unlike the tone itself.
+        after, after_rate, _ = decode_audio(
+            media, ffmpeg, start=alignment.coarse_seconds + 2.0, duration=20.0,
+            rate=DETECTION_RATE,
+        )  # fmt: skip
+        levels = np.sqrt(np.mean(np.square(after, dtype=np.float64), axis=0))
+        hearing = [c for c in hearing if levels[c] >= 1e-3 * float(levels.max())]
+        majority, lags = channel_majority(after, after_rate, hearing)
+        alignment.channel_lags_ms = {c + 1: round(v * 1000, 3) for c, v in lags.items()}
+        hearing = majority
+    alignment.channel = max(hearing, key=lambda c: scores[c])
+
     onsets: dict[int, float] = {}
-    for channel, score in enumerate(scores):
-        if score < 0.25 * max(scores):
-            continue
+    for channel in hearing:
         try:
             onset, _ = detect_beep(
                 samples[:, channel],
@@ -1150,6 +1296,65 @@ def coarse_search(
     return best_start, best_value / max(runner_up, 1e-12)
 
 
+def relocate_by_conversation(
+    alignment: Alignment,
+    references: list[Alignment],
+    ffmpeg: str,
+    *,
+    frequency_hz: float,
+    coarse_rate: int = 2000,
+) -> bool:
+    """Look for the beep again where the file's conversation says it must be.
+
+    Used for a file that no correlation pair confirmed: its beep position was
+    probably wrong by more than the correlation search range.  A minute of
+    its audio is searched for on the whole timeline of each confirmed
+    reference; the beep is then sought within 2 s of the predicted position.
+    """
+    media = alignment.media
+    query_offset = min(300.0, max(0.0, media.duration - 60.0))
+    query_length = min(60.0, media.duration - query_offset)
+    if query_length < 10.0:
+        return False
+    samples, _, _ = decode_audio(
+        media, ffmpeg, start=query_offset, duration=query_length, rate=coarse_rate
+    )
+    query = samples[:, alignment.channel].astype(np.float64)
+    # Audio-only recordings first: decoding them is far cheaper than a 4 GB video.
+    for reference in sorted(references, key=lambda r: r.media.has_video):
+        lowest = reference.pieces()[0][1] - query_offset
+        highest = reference.out_end - query_offset - query_length
+        if highest <= lowest:
+            continue
+        found = coarse_search(query, reference, ffmpeg, lowest, highest, query_offset, coarse_rate)
+        if found is None or found[1] < 1.5:
+            continue
+        # The output timeline is 0 at the beep, so the file's beep is at -start.
+        expected = -found[0]
+        if not 0.0 <= expected < media.duration:
+            continue
+        try:
+            onset, details = locate_beep(
+                media, ffmpeg, start=max(0.0, expected - 2.0), length=4.0,
+                frequency_hz=frequency_hz,
+            )  # fmt: skip
+        except SyncError:
+            onset = None
+        if onset is not None and abs(onset - expected) <= 1.0:
+            alignment.coarse_seconds, alignment.coarse_details = onset, details
+            alignment.confidence, alignment.source = "conversation-guided", "beep"
+        else:
+            alignment.coarse_seconds = expected
+            alignment.confidence, alignment.source = "conversation-only", "conversation"
+        eprint(
+            f"  {media.path.name}: {reference.media.label}との会話の相関から"
+            f"同期音を{alignment.coarse_seconds:.3f}秒に置き直しました"
+        )
+        refine_on_best_channel(alignment, ffmpeg, frequency_hz=frequency_hz)
+        return True
+    return False
+
+
 def fine_alignment(
     segment: Segment,
     channel: int,
@@ -1225,6 +1430,11 @@ def place_segment(
     """
     segment = alignment.segments[index]
     media = segment.media
+    # A beep-only placement can be wrong even with a strong tone detection.
+    # Prefer references validated by the conversation correlation graph.
+    verified = [r for r in references if r.pairs_used > 0]
+    if verified:
+        references = verified
     previous_media, previous_start, _ = alignment.pieces()[index]
     end, _, end_mean = previous_end(alignment, index)
     if media.timecode_seconds is not None and previous_media.timecode_seconds is not None:
@@ -1260,7 +1470,7 @@ def place_segment(
         lowest = end - 1.0
         highest = max((r.out_end for r in references), default=lowest)
     # Audio-only recordings first: decoding them is far cheaper than a 4 GB video.
-    best: tuple[float, float, Alignment] | None = None
+    candidates: list[tuple[float, float, Alignment]] = []
     for reference in sorted(references, key=lambda r: r.media.has_video):
         reach_low = max(lowest, reference.pieces()[0][1] - query_offset)
         reach_high = min(highest, reference.out_end - query_offset - query_length)
@@ -1269,22 +1479,26 @@ def place_segment(
         found = coarse_search(
             query, reference, ffmpeg, reach_low, reach_high, query_offset, coarse_rate
         )
-        if found and (best is None or found[1] > best[1]):
-            best = (found[0], found[1], reference)
-        if best and best[1] >= 4.0:
-            break
-    if best is None:
+        if found:
+            candidates.append((found[0], found[1], reference))
+    if not candidates:
         return False
 
-    estimate, ratio, reference = best
-    segment.coarse_peak_ratio = round(ratio, 2)
-    refined = fine_alignment(
-        segment, alignment.channel, reference, estimate, ffmpeg,
-        window=window, interval=interval, max_lag=0.02,
-        max_drift_ppm=max_drift_ppm, fit_tolerance=0.002,
-    )  # fmt: skip
-    if refined is None or ratio < 1.5:
+    refined = None
+    for estimate, ratio, reference in sorted(candidates, key=lambda item: item[1], reverse=True):
+        if ratio < 1.5:
+            continue
+        refined = fine_alignment(
+            segment, alignment.channel, reference, estimate, ffmpeg,
+            window=window, interval=interval, max_lag=0.02,
+            max_drift_ppm=max_drift_ppm, fit_tolerance=0.002,
+        )  # fmt: skip
+        if refined is not None:
+            break
+        eprint(f"  {media.path.name}: {reference.media.label}との精密相関が不成立、別の参照を試します")
+    if refined is None:
         return fall_back("相関で位置を決められません")
+    segment.coarse_peak_ratio = round(ratio, 2)
     start_on_reference, drift_vs_reference, windows, inliers, rms = refined
     # Express the start in mean time: the reference itself drifts.
     start = mean_time(
@@ -1363,7 +1577,7 @@ def place_segments(
 
 
 def output_layout(
-    alignment: Alignment, pre_roll: float, duration: float
+    alignment: Alignment, pre_roll: float, duration: float, *, stream: str | int | None = None
 ) -> list[tuple[int | None, float, float, float]]:
     """Pieces of the output ``[0, duration)``: ``(file index or None for a gap, from, to, file time at from)``.
 
@@ -1372,16 +1586,29 @@ def output_layout(
     pieces = alignment.pieces()
     layout: list[tuple[int | None, float, float, float]] = []
     cursor = 0.0
+
+    def bounds(media: Media, start: float) -> tuple[float, float]:
+        if stream == "video":
+            offset, length = media.video_offset, media.video_duration
+        elif isinstance(stream, int):
+            audio = media.audio[stream]
+            offset, length = audio.offset, audio.duration
+        else:
+            offset, length = 0.0, None
+        return start + offset + pre_roll, length if length is not None else media.duration - offset
+
     for index, (media, out_start, _) in enumerate(pieces):
-        begin = max(cursor, out_start + pre_roll)
-        end = min(duration, out_start + pre_roll + media.duration)
+        track_start, track_duration = bounds(media, out_start)
+        begin = max(cursor, track_start)
+        end = min(duration, track_start + track_duration)
         if index + 1 < len(pieces):
-            end = min(end, pieces[index + 1][1] + pre_roll)
+            next_media, next_start, _ = pieces[index + 1]
+            end = min(end, bounds(next_media, next_start)[0])
         if end <= begin:
             continue
         if begin > cursor:
             layout.append((None, cursor, begin, 0.0))
-        layout.append((index, begin, end, begin - (out_start + pre_roll)))
+        layout.append((index, begin, end, begin - track_start))
         cursor = end
     if cursor < duration:
         layout.append((None, cursor, duration, 0.0))
@@ -1421,8 +1648,8 @@ def stitch_filters(
                 source = f"color=c=black:s={size[0]}x{size[1]}:r={exact}"
             else:
                 source = (
-                    f"[{first_input + index}:v:0]trim=start={file_start:.9f},"
-                    f"setpts=PTS-STARTPTS,fps={exact}"
+                    f"[{first_input + index}:v:0]setpts=PTS-STARTPTS,trim=start={file_start:.9f},"
+                    f"setpts=PTS-STARTPTS,fps={exact},tpad=stop=-1:stop_mode=add"
                 )
             filters.append(
                 f"{source},trim=end_frame={count},setpts=PTS-STARTPTS,"
@@ -1436,8 +1663,8 @@ def stitch_filters(
             else:
                 routing = "|".join(f"c{c}=c{c}" for c in range(channels))
                 source = (
-                    f"[{first_input + index}:a:{stream}]atrim=start={file_start:.9f},"
-                    f"asetpts=PTS-STARTPTS,aresample={round(rate)},pan={name}|{routing}"
+                    f"[{first_input + index}:a:{stream}]asetpts=PTS-STARTPTS,atrim=start={file_start:.9f},"
+                    f"asetpts=PTS-STARTPTS,aresample={round(rate)},pan={name}|{routing},apad"
                 )
             filters.append(f"{source},atrim=end_sample={count},asetpts=PTS-STARTPTS[{part}]")
         parts.append(f"[{part}]")
@@ -1461,7 +1688,6 @@ def write_stitched_file(
     """Write a split recording as one file, gaps filled with black and silence."""
     media = alignment.media
     assert media.output_path is not None
-    layout = output_layout(alignment, pre_roll, duration)
     files = [m for m, _, _ in alignment.pieces()]
     command = [ffmpeg, "-y", "-v", "error", "-stats"]
     for item in files:
@@ -1472,11 +1698,15 @@ def write_stitched_file(
     maps: list[str] = []
     if media.has_video:
         assert media.fps and media.video_size
-        filters += stitch_filters(layout, 0, "v", stream=None, rate=media.fps, size=media.video_size)
+        filters += stitch_filters(
+            output_layout(alignment, pre_roll, duration, stream="video"), 0, "v",
+            stream=None, rate=media.fps, size=media.video_size,
+        )
         maps += ["-map", "[v]"]
     for number, stream in enumerate(media.audio):
         filters += stitch_filters(
-            layout, 0, f"a{number}", stream=number, rate=stream.sample_rate,
+            output_layout(alignment, pre_roll, duration, stream=number), 0, f"a{number}",
+            stream=number, rate=stream.sample_rate,
             channels=stream.channels,
         )  # fmt: skip
         maps += ["-map", f"[a{number}]"]
@@ -1563,14 +1793,14 @@ def write_check_wav(
         files = [m for m, _, _ in alignment.pieces()]
         for item in files:
             command += ["-i", str(item.path)]
-        layout = output_layout(alignment, pre_roll, duration)
         for stream_order, stream in enumerate(media.audio):
             label = f"a{recording}_{stream_order}"
             # "Nc" layouts (not 2.0, 5.1, ...) so that amerge just stacks channels.
             filters += [
                 f.replace(f"pan={channel_layout_name(stream.channels)}|", f"pan={stream.channels}c|")
                 for f in stitch_filters(
-                    layout, next_input, label, stream=stream_order, rate=rate,
+                    output_layout(alignment, pre_roll, duration, stream=stream_order),
+                    next_input, label, stream=stream_order, rate=rate,
                     channels=stream.channels,
                 )
             ]  # fmt: skip
@@ -1628,6 +1858,7 @@ def write_report(
                 "analysis_channel": a.channel + 1,
                 "channel_beep_scores": a.channel_scores,
                 "channel_onsets_seconds": a.channel_onsets,
+                "channel_lags_ms": a.channel_lags_ms,
                 "timecode": m.timecode,
                 "timecode_status": a.timecode_status,
                 "timecode_predicted_beep_seconds": rounded(a.timecode_beep_seconds),
@@ -1787,6 +2018,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("-o", "--output-dir", type=Path, required=True, help="出力先ディレクトリ")
     parser.add_argument("--analyze-only", action="store_true", help="解析とreport.jsonだけを行う")
     parser.add_argument(
+        "--duration-mode", choices=["shortest", "longest"], default="shortest",
+        help="出力の長さ。shortest=最短の入力、longest=最長の入力（不足分は黒画面・無音）",
+    )
+    parser.add_argument(
         "--fast-copy", action="store_true", help="映像を再エンコードせず切り出す（キーフレーム精度）"
     )
     parser.add_argument(
@@ -1856,6 +2091,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SyncError("同じファイルが複数回指定されています。")
     if args.fast_copy and any(len(group) > 1 for group in groups):
         raise SyncError("--fast-copy は分割ファイル（+ でつないだ入力）には使えません。")
+    if args.fast_copy and args.duration_mode == "longest":
+        raise SyncError("--duration-mode longest は黒画面を生成するため --fast-copy と併用できません。")
 
     media = [probe_media(group[0], index, ffprobe) for index, group in enumerate(groups)]
     assign_labels_and_outputs(media, output_dir)
@@ -1887,6 +2124,7 @@ def main(argv: list[str] | None = None) -> int:
                 start=args.search_start,
                 length=args.search_seconds,
                 frequency_hz=args.beep_frequency,
+                prefer_early=True,
             )
         except SyncError as error:
             eprint(f"  検出失敗: {error}")
@@ -1914,23 +2152,40 @@ def main(argv: list[str] | None = None) -> int:
         refine_on_best_channel(alignment, ffmpeg, frequency_hz=args.beep_frequency)
 
     # 3. Pairwise correlation and joint solution.
-    eprint("相互相関を計算中")
-    pairs, times = correlate_all(
-        alignments,
-        ffmpeg,
-        window=args.corr_window,
-        interval=args.corr_interval,
-        max_lag=args.max_lag_ms / 1000.0,
-        timecode_max_lag=0.25,
-        max_drift_ppm=args.max_drift_ppm,
-        fit_tolerance=0.002,
-        outlier_tolerance=0.001,
-    )
+    def correlate() -> tuple[list[PairResult], list[float]]:
+        found = correlate_all(
+            alignments,
+            ffmpeg,
+            window=args.corr_window,
+            interval=args.corr_interval,
+            max_lag=args.max_lag_ms / 1000.0,
+            timecode_max_lag=0.25,
+            max_drift_ppm=args.max_drift_ppm,
+            fit_tolerance=0.002,
+            outlier_tolerance=0.001,
+        )
+        for alignment in alignments:
+            assert alignment.onset_seconds is not None
+            alignment.beep_seconds = alignment.onset_seconds + alignment.correction_seconds
+            alignment.trim_start_seconds = alignment.beep_seconds - args.pre_roll
+        return found
 
-    for alignment in alignments:
-        assert alignment.onset_seconds is not None
-        alignment.beep_seconds = alignment.onset_seconds + alignment.correction_seconds
-        alignment.trim_start_seconds = alignment.beep_seconds - args.pre_roll
+    eprint("相互相関を計算中")
+    pairs, times = correlate()
+    # A file no pair confirmed probably had its beep misplaced by more than the
+    # correlation range: place it by the conversation and correlate again.
+    unconfirmed = [a for a in alignments if a.pairs_used == 0 and a.source != "manual"]
+    confirmed = [a for a in alignments if a.pairs_used > 0]
+    if unconfirmed and confirmed:
+        moved = False
+        for alignment in unconfirmed:
+            eprint(f"相関が取れないため、会話の位置から同期音を探し直します: {alignment.media.path.name}")
+            moved |= relocate_by_conversation(
+                alignment, confirmed, ffmpeg, frequency_hz=args.beep_frequency
+            )
+        if moved:
+            eprint("相互相関を再計算中")
+            pairs, times = correlate()
     too_early = [a.media.path.name for a in alignments if (a.trim_start_seconds or 0) < 0]
 
     # 4. Later files of split recordings.
@@ -1942,7 +2197,8 @@ def main(argv: list[str] | None = None) -> int:
             window=args.corr_window, interval=args.corr_interval,
             max_drift_ppm=args.max_drift_ppm,
         )  # fmt: skip
-    common_duration = min(a.out_end + args.pre_roll for a in alignments)
+    choose_duration = max if args.duration_mode == "longest" else min
+    common_duration = choose_duration(a.out_end + args.pre_roll for a in alignments)
 
     settings = {
         k: (str(v) if isinstance(v, Path) else v)
@@ -1980,7 +2236,7 @@ def main(argv: list[str] | None = None) -> int:
     review = [
         a.media.path.name
         for a in alignments
-        if a.confidence == "timecode-only" or a.pairs_used == 0
+        if a.confidence in {"timecode-only", "conversation-only"} or a.pairs_used == 0
     ] + [s.media.path.name for a in alignments for s in a.segments if s.method == "timecode-only"]
     if review:
         eprint("警告: 次のファイルは同期結果を確認してください: " + ", ".join(review))
@@ -2004,7 +2260,7 @@ def main(argv: list[str] | None = None) -> int:
     eprint(f"共通区間: {common_duration:.3f}秒")
     for alignment in alignments:
         eprint(f"切り出し中: {alignment.media.path.name} -> {alignment.media.output_path}")
-        if alignment.segments:
+        if alignment.segments or args.duration_mode == "longest":
             write_stitched_file(
                 alignment, args.pre_roll, common_duration,
                 ffmpeg=ffmpeg, video_encoder=video_encoder, video_bitrate=args.video_bitrate,
