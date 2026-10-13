@@ -436,22 +436,62 @@ def probe_media(path: Path, position: int, ffprobe: str) -> Media:
     )
 
 
-def assign_labels_and_outputs(media: list[Media], output_dir: Path) -> None:
-    """Name outputs ``<stem>_sync<ext>``; prefix the folder name on clashes."""
-    stems = [m.path.stem for m in media]
+def output_suffix(media: Media) -> str:
+    """Synced files are MP4 when they have video and WAV otherwise, whatever the source."""
+    return ".mp4" if media.has_video else ".wav"
+
+
+LOSSLESS_CODECS = {"flac", "alac", "wavpack", "tta", "ape", "mlp", "truehd"}
+
+
+def wav_codec(media: Media) -> str:
+    """PCM codec for a WAV output: keep PCM as it is (little-endian), else 24 / 16 bit."""
+    codec = media.main_audio.codec
+    if codec.startswith("pcm_"):
+        return codec.replace("be", "le") if codec.endswith("be") else codec
+    return "pcm_s24le" if codec in LOSSLESS_CODECS else "pcm_s16le"
+
+
+def unique_stems(paths: list[Path]) -> list[str]:
+    """Output stems that cannot collide although every output is .mp4 or .wav.
+
+    Files that share a stem get what tells them apart: the folder name in
+    front (different folders), the source extension behind (same folder), or
+    both; a counter is the last resort.
+    """
+    groups: dict[str, list[Path]] = {}
+    for path in paths:
+        groups.setdefault(path.stem.lower(), []).append(path)
+    names = []
+    for path in paths:
+        group = groups[path.stem.lower()]
+        name = path.stem
+        if len(group) > 1:
+            folders = [p.parent.name for p in group]
+            suffixes = [p.suffix.lower() for p in group]
+            if len(set(folders)) == len(group):
+                name = f"{path.parent.name}_{name}"
+            elif len(set(suffixes)) == len(group):
+                name = f"{name}_{path.suffix.lstrip('.')}"
+            else:
+                name = f"{path.parent.name}_{name}_{path.suffix.lstrip('.')}"
+        names.append(name)
     used: set[str] = set()
-    for item in media:
-        stem = item.path.stem
-        if stems.count(stem) > 1:
-            stem = f"{item.path.parent.name}_{stem}"
-        candidate = stem
-        counter = 2
+    result = []
+    for name in names:
+        candidate, counter = name, 2
         while candidate.lower() in used:
-            candidate = f"{stem}_{counter}"
-            counter += 1
+            candidate, counter = f"{name}_{counter}", counter + 1
         used.add(candidate.lower())
-        item.label = candidate
-        item.output_path = output_dir / f"{candidate}_sync{item.path.suffix}"
+        result.append(candidate)
+    return result
+
+
+def assign_labels_and_outputs(media: list[Media], output_dir: Path) -> None:
+    """Name outputs ``<stem>_sync.mp4`` / ``.wav`` (see ``unique_stems``)."""
+    for item, stem in zip(media, unique_stems([m.path for m in media])):
+        item.label = stem
+        item.output_path = output_dir / f"{stem}_sync{output_suffix(item)}"
 
 
 # ---------------------------------------------------------------------------
@@ -1719,11 +1759,7 @@ def write_stitched_file(
             command += ["-b:v", bitrate]
         command += ["-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
     else:
-        codec = media.main_audio.codec
-        if codec.startswith("pcm_"):
-            command += ["-c:a", codec]
-        if media.path.suffix.lower() == ".wav":
-            command += ["-rf64", "auto"]
+        command += ["-c:a", wav_codec(media), "-rf64", "auto"]
     command.append(str(media.output_path))
     run_checked(command)
 
@@ -1747,7 +1783,12 @@ def write_synced_file(
         command += ["-ss", f"{start:.9f}", "-i", str(media.path), "-t", f"{duration:.9f}"]
         command += ["-map", "0:v:0", "-map", "0:a?", "-map_metadata", "-1"]
         if fast_copy:
-            command += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
+            # The video is copied; the audio becomes AAC, since MP4 cannot hold
+            # every source codec (PCM from MOV, for example).
+            command += [
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-avoid_negative_ts", "make_zero", "-movflags", "+faststart",
+            ]  # fmt: skip
         else:
             options, default_bitrate = VIDEO_ENCODERS[video_encoder]
             command += ["-c:v", video_encoder, *options]
@@ -1764,11 +1805,7 @@ def write_synced_file(
             "-af",
             f"atrim=start={start:.9f}:duration={duration:.9f},asetpts=PTS-STARTPTS",
         ]
-        codec = media.main_audio.codec
-        if codec.startswith("pcm_"):
-            command += ["-c:a", codec]
-        if media.path.suffix.lower() == ".wav":
-            command += ["-rf64", "auto"]
+        command += ["-c:a", wav_codec(media), "-rf64", "auto"]
     command.append(str(media.output_path))
     run_checked(command)
 
