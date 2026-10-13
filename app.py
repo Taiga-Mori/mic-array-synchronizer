@@ -1,11 +1,10 @@
 import argparse
-import sys
-from pathlib import Path
+import os
 
-import streamlit.web.cli as stcli
+from web_server import serve
 
 
-def streamlit_run() -> None:
+def main() -> None:
     parser = argparse.ArgumentParser(prog="mic-array-synchronizer")
     parser.add_argument("--port", type=int, default=None, help="GUIのポート番号（省略時は8501から空いているポートを自動で使用）")
     parser.add_argument(
@@ -13,14 +12,11 @@ def streamlit_run() -> None:
         default="localhost",
         help="待ち受けるアドレス（標準はlocalhostのみ。SSH越しに使うときは ssh -L でポートを転送する）",
     )
+    parser.add_argument("--no-browser", action="store_true", help="起動時にブラウザを開かない")
     args = parser.parse_args()
-
-    src = str(Path(__file__).resolve().parent / "gui.py")
-    sys.argv = ["streamlit", "run", src, "--global.developmentMode=false", f"--server.address={args.address}"]
-    if args.port is not None:
-        sys.argv.append(f"--server.port={args.port}")
-    sys.exit(stcli.main())
+    over_ssh = bool(os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_CLIENT"))
+    serve(args.address, args.port, open_browser=not (args.no_browser or over_ssh))
 
 
 if __name__ == "__main__":
-    streamlit_run()
+    main()

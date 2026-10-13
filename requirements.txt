@@ -1,9 +1,9 @@
 numpy==2.2.6
-streamlit==1.54.0
 
 # Also required, but not installed by pip:
 # - ffmpeg and ffprobe: put them in ffmpeg/mac, ffmpeg/win or ffmpeg/AMD,
 #   or have them on PATH (or pass --ffmpeg / --ffprobe)
+# The browser GUI (app.py) uses only the Python standard library.
 
 # Only for regenerating the README figures (docs/make_figures.py):
 # pillow==12.3.0

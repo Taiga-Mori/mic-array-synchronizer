@@ -1865,6 +1865,17 @@ def write_check_wav(
     return rate, channel_map
 
 
+def json_safe(value: Any) -> Any:
+    """NaN and infinity become null, so that report.json is standard JSON."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    return value
+
+
 def write_report(
     path: Path,
     alignments: list[Alignment],
@@ -1973,7 +1984,10 @@ def write_report(
         ],
         "check_wav": check_wav,
     }
-    path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(json_safe(report), ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
 
 
 # ---------------------------------------------------------------------------

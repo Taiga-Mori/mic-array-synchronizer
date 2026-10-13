@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Background jobs for the web GUI.
 
-A job runs sync_media.py or compose_media.py in a detached process, so it keeps
+A job runs sync_media.py, compose_media.py or trim_media.py in a detached process, so it keeps
 going when the browser tab is closed or the SSH connection drops.  Everything
 about a job lives in its own folder under ``~/.mic-array-synchronizer/jobs``:
 
@@ -31,7 +31,7 @@ from sync_media import PROGRESS_ENV
 
 HERE = Path(__file__).resolve().parent
 JOBS_DIR = Path.home() / ".mic-array-synchronizer" / "jobs"
-SCRIPTS = {"sync": "sync_media.py", "compose": "compose_media.py"}
+SCRIPTS = {"sync": "sync_media.py", "compose": "compose_media.py", "trim": "trim_media.py"}
 
 
 @dataclass
@@ -252,6 +252,67 @@ def compose_progress(lines: list[str]) -> tuple[float, str]:
             seconds = float(line.split()[1])
             fraction = min(1.0, seconds / duration)
             status = f"合成中… {seconds / 60:.1f} / {duration / 60:.1f} 分"
+    return fraction, status
+
+
+def trim_progress(lines: list[str], durations: list[float]) -> tuple[float, str]:
+    """``durations``: length of each range, in the order ranges are given."""
+    fraction, status = 0.0, "開始しています…"
+    current = total = 0
+    for line in lines:
+        match = re.match(r"切り抜き中 \((\d+)/(\d+)\): (.*)", line)
+        if match:
+            current, total = int(match.group(1)), int(match.group(2))
+            fraction = (current - 1) / total
+            status = f"切り抜き中（{current}/{total}）: {match.group(3)}"
+        elif line.startswith("PROGRESS ") and current and durations:
+            length = durations[(current - 1) % len(durations)]
+            done = min(1.0, float(line.split()[1]) / max(length, 1e-6))
+            fraction = (current - 1 + done) / total
+    return fraction, status
+
+
+def option(arguments: list[str], *names: str) -> str | None:
+    for name in names:
+        if name in arguments:
+            index = arguments.index(name)
+            if index + 1 < len(arguments):
+                return arguments[index + 1]
+    return None
+
+
+def positional_after_output(arguments: list[str]) -> list[str]:
+    """Inputs of a sync / trim job: the positional arguments right after ``-o DIR``."""
+    index = arguments.index("-o") + 2 if "-o" in arguments else 0
+    inputs = []
+    for argument in arguments[index:]:
+        if argument.startswith("-"):
+            break
+        inputs.append(argument)
+    return inputs
+
+
+def progress(job: Job) -> tuple[float, str]:
+    """(fraction, status) for any job, from its log."""
+    state = job.state
+    if state == "done":
+        return 1.0, "完了しました"
+    lines = job.log_lines
+    arguments = job.arguments
+    if job.kind == "sync":
+        fraction, status = sync_progress(
+            lines, max(1, len(positional_after_output(arguments))), "--analyze-only" in arguments
+        )
+    elif job.kind == "compose":
+        fraction, status = compose_progress(lines)
+    else:
+        from trim_media import parse_range  # local: keeps the runner light
+
+        ranges = [parse_range(a) for i, a in enumerate(arguments) if i and arguments[i - 1] in ("-r", "--range")]
+        fraction, status = trim_progress(lines, [r.end - r.start for r in ranges])
+    if state != "running":
+        status = {"failed": "エラーで終了しました", "stopped": "中止しました",
+                  "lost": "中断しました（実行プロセスが見つかりません）"}[state]  # fmt: skip
     return fraction, status
 
 

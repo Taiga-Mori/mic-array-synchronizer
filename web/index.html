@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>会話収録メディアの同期・合成</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <h1>会話収録メディアの同期・合成</h1>
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-tab="sync" class="active">同期</button>
+    <button role="tab" data-tab="compose">合成</button>
+    <button role="tab" data-tab="trim">切り抜き</button>
+  </nav>
+</header>
+
+<main>
+  <!-- 同期 -->
+  <section class="tab" id="tab-sync">
+    <div class="form">
+      <div class="card">
+        <h2>入力（録音・録画ごとに1行）</h2>
+        <p class="hint">同じ会話のカメラ映像とマイク音声をすべて入れます。1台の録画・録音が複数のファイルに分かれている場合は、その行の「分割ファイルを追加」で録画順に足します（+ でつながります）。行はドラッグで並べ替えられます（sync_check.wav のチャンネル順になります）。</p>
+        <ol class="rows" id="sync-inputs"></ol>
+        <div class="buttons"><button data-pick="sync-inputs">ファイルを追加…</button><button class="ghost" data-clear="sync-inputs">すべて消す</button></div>
+      </div>
+      <div class="card">
+        <h2>出力フォルダ</h2>
+        <div class="path-field"><input id="sync-output" placeholder="/path/to/sync/TK002"><button data-pick-folder="sync-output">参照…</button></div>
+      </div>
+      <div class="card">
+        <h2>オプション</h2>
+        <div class="grid">
+          <label class="check"><input type="checkbox" id="sync-analyze-only"> 解析だけ行う（report.json のみ）</label>
+          <label class="check"><input type="checkbox" id="sync-fast-copy"> 映像を再エンコードしない（速いがキーフレーム単位）</label>
+          <label>出力の長さ
+            <select id="sync-duration-mode"><option value="shortest">最も早く終わる機材に合わせる</option><option value="longest">最も遅く終わる機材に合わせる（不足は黒・無音）</option></select></label>
+          <label>映像エンコーダ <select id="sync-encoder"></select></label>
+          <label>ビットレート（空欄=標準） <input id="sync-bitrate" placeholder="20M"></label>
+          <label>同期音の何秒前から残すか <input id="sync-pre-roll" type="number" step="0.01" min="0" value="0.05"></label>
+          <label>相関の探索範囲（±ms） <input id="sync-max-lag" type="number" step="1" min="1" value="1000"></label>
+        </div>
+        <label class="wide">同期音の位置を手で指定（1行に1つ、ファイル名=秒）
+          <textarea id="sync-manual" rows="2" placeholder="261010_1356.wav=17.53"></textarea></label>
+        <label class="wide">その他の引数 <input id="sync-extra" placeholder="--segment-gap GX020045.MP4=0"></label>
+      </div>
+      <div class="actions"><button class="primary" id="sync-start">同期を開始</button></div>
+    </div>
+    <aside class="run" data-kind="sync"></aside>
+  </section>
+
+  <!-- 合成 -->
+  <section class="tab hidden" id="tab-compose">
+    <div class="form">
+      <div class="card">
+        <h2>映像（左上から順に配置）</h2>
+        <ol class="rows" id="compose-videos"></ol>
+        <div class="buttons"><button data-pick="compose-videos">ファイルを追加…</button><button class="ghost" data-clear="compose-videos">すべて消す</button></div>
+        <div class="radio-row" id="compose-layout">
+          <span>配置</span>
+          <label><input type="radio" name="layout" value="row"> 横一列</label>
+          <label><input type="radio" name="layout" value="column"> 縦一列</label>
+          <label><input type="radio" name="layout" value="grid" checked> なるべく正方形</label>
+        </div>
+      </div>
+      <div class="card">
+        <h2>音声</h2>
+        <ol class="rows" id="compose-audios"></ol>
+        <div class="buttons"><button data-pick="compose-audios">ファイルを追加…</button><button class="ghost" data-clear="compose-audios">すべて消す</button></div>
+        <div class="radio-row">
+          <span>音声の形</span>
+          <label><input type="radio" name="audio-mode" value="mix" checked> 1chにミックス</label>
+          <label><input type="radio" name="audio-mode" value="multi"> 全チャンネル</label>
+        </div>
+      </div>
+      <div class="card">
+        <h2>映像の形式・大きさ・ビットレート</h2>
+        <div class="grid">
+          <label>形式 <select id="compose-codec"><option value="source">入力のまま</option><option value="hevc">HEVC</option><option value="h264">H.264</option></select></label>
+          <label>エンコーダ <select id="compose-encoder"><option value="auto">自動</option><option value="hardware">ハードウェア</option><option value="software">CPU</option></select></label>
+          <label>1画面の大きさ（空欄=入力のまま） <input id="compose-cell" placeholder="960x540"></label>
+          <label>ビットレート（空欄=入力のまま） <input id="compose-bitrate" placeholder="8M"></label>
+        </div>
+      </div>
+      <div class="card">
+        <h2>出力ファイル</h2>
+        <div class="path-field"><input id="compose-output" placeholder="/path/to/composite.mp4"><button data-pick-save="compose-output">参照…</button></div>
+      </div>
+      <div class="actions"><button class="primary" id="compose-start">合成を開始</button></div>
+    </div>
+    <aside class="run-column">
+      <div class="card">
+        <h2>配置イメージ</h2>
+        <div id="compose-diagram" class="diagram"></div>
+        <div class="preview-bar">
+          <label>時刻（空欄=中央） <input id="compose-preview-at" placeholder="10:00"></label>
+          <button id="compose-preview">実際の1フレームを表示</button>
+        </div>
+        <div id="compose-preview-image"></div>
+      </div>
+      <div class="run" data-kind="compose"></div>
+    </aside>
+  </section>
+
+  <!-- 切り抜き -->
+  <section class="tab hidden" id="tab-trim">
+    <div class="form">
+      <div class="card">
+        <h2>切り抜くメディア</h2>
+        <ol class="rows" id="trim-inputs"></ol>
+        <div class="buttons"><button data-pick="trim-inputs">ファイルを追加…</button><button class="ghost" data-clear="trim-inputs">すべて消す</button></div>
+      </div>
+      <div class="card">
+        <h2>範囲</h2>
+        <p class="hint">時刻は秒（600.5）か [時:]分:秒（10:00、1:02:03.5）。終了の代わりに長さ（+90 など）も書けます。名前は出力ファイル名に使います（空欄なら時刻）。</p>
+        <table class="ranges"><thead><tr><th>開始</th><th>終了 / +長さ</th><th>名前</th><th></th></tr></thead><tbody id="trim-ranges"></tbody></table>
+        <div class="buttons"><button id="trim-add-range">範囲を追加</button></div>
+      </div>
+      <div class="card">
+        <h2>オプション</h2>
+        <div class="grid">
+          <label class="check"><input type="checkbox" id="trim-fast-copy"> 映像を再エンコードしない（速いがキーフレーム単位）</label>
+          <label>形式 <select id="trim-codec"><option value="source">入力のまま</option><option value="hevc">HEVC</option><option value="h264">H.264</option></select></label>
+          <label>エンコーダ <select id="trim-encoder"><option value="auto">自動</option><option value="hardware">ハードウェア</option><option value="software">CPU</option></select></label>
+          <label>ビットレート（空欄=入力のまま） <input id="trim-bitrate" placeholder="8M"></label>
+        </div>
+      </div>
+      <div class="card">
+        <h2>出力フォルダ</h2>
+        <div class="path-field"><input id="trim-output" placeholder="/path/to/clips"><button data-pick-folder="trim-output">参照…</button></div>
+      </div>
+      <div class="actions"><button class="primary" id="trim-start">切り抜きを開始</button></div>
+    </div>
+    <aside class="run" data-kind="trim"></aside>
+  </section>
+</main>
+
+<!-- サーバー上のファイル選択 -->
+<dialog id="picker">
+  <form method="dialog" class="picker">
+    <header>
+      <h2 id="picker-title">ファイルを選択</h2>
+      <button value="cancel" class="ghost" aria-label="閉じる">×</button>
+    </header>
+    <div class="path-field">
+      <button type="button" id="picker-up" title="上のフォルダへ">↑</button>
+      <input id="picker-path">
+      <button type="button" id="picker-go">移動</button>
+    </div>
+    <label class="check"><input type="checkbox" id="picker-media-only" checked> メディアファイルだけ表示</label>
+    <ul id="picker-list" class="picker-list"></ul>
+    <div class="save-name hidden" id="picker-save"><label>ファイル名 <input id="picker-filename" value="composite.mp4"></label></div>
+    <footer>
+      <span id="picker-count" class="hint"></span>
+      <button type="button" id="picker-select-all" class="ghost">すべて選択</button>
+      <button type="button" id="picker-ok" class="primary">追加</button>
+    </footer>
+  </form>
+</dialog>
+
+<div id="toast" role="status"></div>
+<script src="app.js"></script>
+</body>
+</html>
