@@ -177,7 +177,9 @@ def video_filters(
     for index in range(len(videos)):
         label = f"v{index}"
         filters.append(
-            f"[{index}:v:0]fps={rate:.6f},"
+            # start_time=0 keeps a track that starts late (synced files often start
+            # a fraction of a frame in) in place, repeating its first frame.
+            f"[{index}:v:0]fps={rate:.6f}:start_time=0,"
             f"scale={cell_width}:{cell_height}:force_original_aspect_ratio=decrease,"
             f"pad={cell_width}:{cell_height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,"
             f"tpad=stop_mode=clone:stop_duration={duration:.6f},"
@@ -304,7 +306,7 @@ def build_command(
                 label = f"a{offset}_{stream}"
                 routing = "|".join(f"c{c}=c{c}" for c in range(channels))
                 filters.append(
-                    f"[{offset}:a:{stream}]aresample={audio_rate},"
+                    f"[{offset}:a:{stream}]aresample={audio_rate}:first_pts=0,"
                     f"pan={channels}c|{routing},"
                     f"apad=whole_dur={duration:.6f},atrim=duration={duration:.6f}[{label}]"
                 )
