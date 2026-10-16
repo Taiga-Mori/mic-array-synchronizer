@@ -183,7 +183,15 @@ def video_filters(
             f"scale={cell_width}:{cell_height}:force_original_aspect_ratio=decrease,"
             f"pad={cell_width}:{cell_height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,"
             f"tpad=stop_mode=clone:stop_duration={duration:.6f},"
-            f"trim=duration={duration:.6f},setpts=PTS-STARTPTS[{label}]"
+            # trim and setpts leave the frames on a microsecond timebase.  NVENC
+            # reads the frame rate off that timebase, so it sees about a million
+            # frames a second and starves the bitrate (8 Mbps came out as 0.15).
+            # Asking for the frame rate again puts the frames back on a timebase
+            # of 1/rate; they already sit on that grid, so none are dropped or
+            # duplicated.  VideoToolbox did not care, which is why this only
+            # showed up on NVIDIA.
+            f"trim=duration={duration:.6f},setpts=PTS-STARTPTS,"
+            f"fps={rate:.6f}[{label}]"
         )
         labels.append(f"[{label}]")
     if len(videos) == 1:

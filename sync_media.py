@@ -1692,8 +1692,13 @@ def stitch_filters(
                     f"setpts=PTS-STARTPTS,fps={exact},tpad=stop=-1:stop_mode=add"
                 )
             filters.append(
+                # The trailing fps keeps the frames on a timebase of 1/rate:
+                # trim and setpts switch them to microseconds, and NVENC then
+                # reads a frame rate of about a million from it and starves the
+                # bitrate.  The frames are already on the grid, so none are
+                # dropped or duplicated.
                 f"{source},trim=end_frame={count},setpts=PTS-STARTPTS,"
-                f"scale={size[0]}:{size[1]},format=yuv420p,setsar=1[{part}]"
+                f"scale={size[0]}:{size[1]},format=yuv420p,setsar=1,fps={exact}[{part}]"
             )
         else:
             name = channel_layout_name(channels)
